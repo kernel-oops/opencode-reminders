@@ -1,5 +1,5 @@
-import type { ReminderHost, SessionMessage } from "./host"
-import { maxConsecutiveFailures, type Reminder, type State, type PluginConfig } from "./types"
+import type { ReminderHost } from "./host"
+import type { Reminder, State, PluginConfig } from "./types"
 import { saveReminder, deleteReminder, loadReminder } from "./storage"
 import { acquireExecutionLease, acquireMutationLock } from "./leases"
 import { logger } from "./logger"
@@ -34,6 +34,8 @@ type ScheduleOptions = {
   minimumDelayMs?: number
 }
 
+const MAX_TIMER_DELAY_MS = 2_147_483_647
+const IN_FLIGHT_REASON = "Execution may have been admitted; inspect the session before removing and recreating this reminder."
 const RECONCILIATION_DELAY_MS = 250
 const MAX_RECONCILIATION_DELAY_MS = 30_000
 const MAX_RECONCILIATION_ATTEMPT = 1 + Math.ceil(
@@ -265,6 +267,10 @@ export async function scheduleTimer(
     if (state.timers.get(reminder.id) === timer) state.timers.delete(reminder.id)
     if (!isCurrentExecution(reminder.id, host, state, token)) return
 
+    if (Date.now() < reminder.time.nextExecution) {
+      await scheduleTimer(reminder, host, state, config, { ...options, persist: false })
+      return
+    }
     const controller = new AbortController()
     execution.timer = undefined
     execution.controller = controller
@@ -276,7 +282,7 @@ export async function scheduleTimer(
         scheduleReconciliation(reminder.id, host, state, config, { skipOverdue, retryAttempt })
       }
     }
-  }, delay)
+  }, Math.min(delay, MAX_TIMER_DELAY_MS))
   timer.unref()
   execution.timer = timer
   state.timers.set(reminder.id, timer)
@@ -423,104 +429,6 @@ async function skipMissedRecurring(
   return true
 }
 
-async function handlePromptError(
-  reminder: Reminder,
-  occurrence: number,
-  error: any,
-  host: ReminderHost,
-  state: State,
-  config: PluginConfig,
-  retryAttempt: number,
-): Promise<void> {
-  try {
-    let changed = false
-    await withMutationLock(reminder.id, host, async () => {
-      const current = await loadReminder(reminder.id, host)
-      if (!current || current.status !== "active" || current.time.nextExecution !== occurrence) return
-      changed = true
-      if (current.execution === "monitor") {
-        current.status = "paused"
-        current.pauseReason = "Monitor execution failed; inspect the session before explicitly removing and recreating it."
-        await saveReminder(current, host)
-        if (isCurrentGeneration(state, host)) {
-          clearStateReminder(current.id, state)
-          state.reminders.set(current.id, current)
-        }
-      } else if (current.type === "recurring") {
-        // A recurring action survives a failed turn: a transient outage (provider usage
-        // limit, network, server error) must not silently end a long-running sweep.
-        // Interrupted turns neither count nor reset; real failures count towards a pause.
-        const aborted = error?.name === "MessageAbortedError"
-        // A provider usage limit is the account's, not this reminder's fault: it lifts by itself, so it must not
-        // use up the failure allowance (a 45-minute sweep would otherwise pause before a five-hour limit resets).
-        const usageLimited = !aborted && isUsageLimitError(error)
-        if (usageLimited) {
-          logger.error(
-            `Reminder ${current.id} (${current.userDescription}) turn hit a provider usage limit; `
-              + `rescheduling for its next interval without counting a failure`,
-          )
-        } else if (!aborted) {
-          const failures = (current.consecutiveFailures ?? 0) + 1
-          const limit = maxConsecutiveFailures(config)
-          current.consecutiveFailures = failures
-          if (failures >= limit) {
-            current.status = "paused"
-            current.pauseReason = `Paused automatically after ${failures} consecutive failed turns `
-              + `(last: ${describeError(error)}). Check the session, then remove and recreate the reminder.`
-            await saveReminder(current, host)
-            logger.error(`Reminder ${current.id} (${current.userDescription}) paused after ${failures} consecutive failed turns`)
-            if (isCurrentGeneration(state, host)) {
-              clearStateReminder(current.id, state)
-              state.reminders.set(current.id, current)
-            }
-            return
-          }
-          logger.error(
-            `Reminder ${current.id} (${current.userDescription}) turn failed (${failures}/${limit}); `
-              + `rescheduling for its next interval`,
-          )
-        }
-        current.time.nextExecution = Date.now() + current.interval
-        await saveReminder(current, host)
-        if (isCurrentGeneration(state, host)) {
-          state.reminders.set(current.id, current)
-          await scheduleTimer(current, host, state, config, { persist: false })
-        }
-      } else {
-        // One-time actions keep their historical behaviour: dropped after any failed or
-        // interrupted turn, so a single stale action is never replayed later.
-        await deleteReminderLocked(current.id, host, state)
-      }
-    })
-    if (!changed) await reconcileReminder(reminder.id, host, state, config, { retryAttempt })
-  } catch (mutationError) {
-    logger.error(`Failed to handle reminder prompt error ${reminder.id}:`, mutationError)
-    scheduleReconciliation(reminder.id, host, state, config, { retryAttempt })
-  }
-}
-
-// Claude Code's usage-limit wordings ("You've hit your session limit · resets 3:10am", "Usage limit reached", and
-// the provider's own held-run error), as recognised by plugins/claude-code-provider/limit.ts. Context-window,
-// spend and rate limits are ordinary failures.
-const HIT_YOUR_LIMIT = /\byou(?:'|’)?ve\s+(?:hit|reached)\s+your\s+((?:[\w-]+\s+){0,3}?)limit\b/i
-const PLAIN_LIMIT = /\b(?:usage|session|weekly|5-hour|five-hour)\s+limit\s+(?:reached|hit|exceeded)\b|\bout of usage\b/i
-const NOT_USAGE_LIMIT = /\b(?:context|spend|token|rate|monthly|budget|concurren|nesting|size|output)\b/i
-
-export function isUsageLimitError(error: unknown): boolean {
-  const text = error instanceof Error ? error.message : typeof error === "string" ? error : ""
-  const hit = HIT_YOUR_LIMIT.exec(text)
-  if (hit) return !NOT_USAGE_LIMIT.test(hit[1] ?? "")
-  return PLAIN_LIMIT.test(text)
-}
-
-function describeError(error: unknown): string {
-  const text = error instanceof Error ? error.message : typeof error === "string" ? error : "unknown error"
-  return text.length > 200 ? `${text.slice(0, 200)}…` : text
-}
-
-// Busy checks are advisory: server-side queue admission is the atomic boundary.
-// Status comes from live execution events; an unobserved session returns undefined
-// and is admitted through the durable "queue" delivery rather than an advisory pre-check.
 async function monitorIsIdle(reminder: Reminder, host: ReminderHost): Promise<boolean> {
   const session = await host.session.get({ sessionID: reminder.sessionID })
   if (!session || session.id !== reminder.sessionID) {
@@ -537,12 +445,6 @@ export class ReminderPromptError extends Error {
     super(message)
     this.name = kind === "aborted" ? "MessageAbortedError" : "ReminderPromptError"
   }
-}
-
-function assistantAfter(messages: ReadonlyArray<SessionMessage>, messageID: string): SessionMessage | undefined {
-  const index = messages.findIndex((message) => message.id === messageID)
-  if (index < 0) return undefined
-  return messages.slice(index + 1).find((message) => message.type === "assistant")
 }
 
 function errorIsAbort(error: unknown): boolean {
@@ -571,13 +473,7 @@ async function runPrompt(
   host: ReminderHost,
   signal: AbortSignal | undefined,
 ): Promise<void> {
-  const monitor = reminder.execution === "monitor"
   const body = reminderPrompt(reminder)
-  if (body.agent !== undefined) {
-    const session = await host.session.get({ sessionID: reminder.sessionID })
-    if (!session || session.id !== reminder.sessionID) throw new ReminderPromptError("Cannot verify reminder session", "failed")
-    if (session.agent !== body.agent) await host.session.switchAgent({ sessionID: reminder.sessionID, agent: body.agent })
-  }
   const admitted = await host.session.prompt({
     sessionID: reminder.sessionID,
     text: body.text,
@@ -590,15 +486,17 @@ async function runPrompt(
   }
   await raceAbort(host.session.wait({ sessionID: reminder.sessionID }), signal)
   const messages = (await host.session.context({ sessionID: reminder.sessionID })) ?? []
-  const assistant = assistantAfter(messages, admitted.id)
-  if (!assistant || !assistant.time?.completed) {
-    if (monitor) throw new ReminderPromptError("Monitor completion does not match its submitted message; suspension required", "unmatched")
-    throw new ReminderPromptError("Reminder turn did not complete", "aborted")
+  const index = messages.findIndex((message) => message.id === admitted.id)
+  const unique = messages.filter((message) => message.id === admitted.id).length === 1
+  const tail = messages.slice(index + 1)
+  if (index < 0 || !unique || messages[index]?.type !== "user" || tail.length === 0 || tail.some((message) => message.type !== "assistant" || !message.time?.completed)) {
+    throw new ReminderPromptError("Reminder completion is ambiguous; inspect the session", "unmatched")
   }
-  if (assistant.error !== undefined) {
-    if (monitor) throw new ReminderPromptError("Monitor prompt returned an error", "failed")
-    const detail = assistantErrorText(assistant.error)
-    throw new ReminderPromptError(detail ? `Reminder turn failed: ${detail}` : "Reminder turn failed", errorIsAbort(assistant.error) ? "aborted" : "failed")
+  for (const assistant of tail) {
+    if (assistant.error !== undefined) {
+      const detail = assistantErrorText(assistant.error)
+      throw new ReminderPromptError(detail ? `Reminder turn failed: ${detail}` : "Reminder turn failed", errorIsAbort(assistant.error) ? "aborted" : "failed")
+    }
   }
 }
 
@@ -706,20 +604,52 @@ export async function executeReminder(
           return
         }
       }
+      const body = reminderPrompt(reminder)
+      if (body.agent !== undefined) {
+        const session = await host.session.get({ sessionID: reminder.sessionID })
+        if (!session || session.id !== reminder.sessionID || session.agent !== body.agent) {
+          throw new ReminderPromptError("Session agent does not match the reminder; refusing to switch it", "unmatched")
+        }
+      }
+      if (!isCurrentExecution(reminder.id, host, state, token)) return
+      // Persist uncertainty before admission so a reload does not replay this occurrence.
+      const armed = await withMutationLock(reminder.id, host, async () => {
+        if (!isCurrentExecution(reminder.id, host, state, token)) return false
+        const current = await loadReminder(reminder.id, host)
+        if (!current || current.status !== "active" || current.time.nextExecution !== occurrence) return false
+        current.status = "paused"
+        current.pauseReason = IN_FLIGHT_REASON
+        await saveReminder(current, host)
+        state.reminders.set(current.id, current)
+        return true
+      })
+      if (!armed || !isCurrentExecution(reminder.id, host, state, token)) return
       await runPrompt(reminder, host, signal)
     } catch (error: any) {
       if (!isCurrentExecution(reminder.id, host, state, token)) return
       logger.error(`Reminder ${reminder.id} prompt failed:`, error)
-      await handlePromptError(reminder, occurrence, error, host, state, config, retryAttempt)
+      // Unknown admission or completion must never be retried automatically.
+      await withMutationLock(reminder.id, host, async () => {
+        if (!isCurrentExecution(reminder.id, host, state, token)) return
+        const current = await loadReminder(reminder.id, host)
+        if (!current || current.time.nextExecution !== occurrence) return
+        if (current.status === "active") {
+          current.status = "paused"
+          current.pauseReason = "Reminder execution failed before admission; inspect and remove or recreate it."
+          await saveReminder(current, host)
+        }
+        if (current.status === "paused") state.reminders.set(current.id, current)
+      })
       return
     }
 
-    // A stale generation may finish after an API ignores abort. Its occurrence lease and
-    // conditional durable transition still prevent resurrection or a duplicate local prompt.
+    // Only a confirmed execution owned by this generation may clear the durable guard.
     try {
       const completed = await withMutationLock<Reminder | null>(reminder.id, host, async () => {
         const current = await loadReminder(reminder.id, host)
-        if (!current || current.status !== "active" || current.time.nextExecution !== occurrence) return null
+        if (!isCurrentExecution(reminder.id, host, state, token) || !current || current.status !== "paused" || current.pauseReason !== IN_FLIGHT_REASON || current.time.nextExecution !== occurrence) return null
+        current.status = "active"
+        delete current.pauseReason
         current.time.lastExecution = Date.now()
         reminder.time.lastExecution = current.time.lastExecution
         // A successful turn clears the failure streak.
@@ -811,9 +741,9 @@ export async function pauseReminder(
     if (!isCurrentGeneration(state, host)) return false
     const current = await loadReminder(id, host)
     if (!current || current.sessionID !== sessionID || current.status === "cancelled") return false
-    if (current.status !== "paused") {
+    if (current.status !== "paused" || current.pauseReason === IN_FLIGHT_REASON) {
       current.status = "paused"
-      current.pauseReason = reason
+      current.pauseReason = reason === IN_FLIGHT_REASON ? `Requested pause: ${reason}` : reason
       await saveReminder(current, host)
     }
     const timer = state.timers.get(id)

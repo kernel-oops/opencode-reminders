@@ -36,7 +36,7 @@ export async function createFakeHost(directory?: string): Promise<FakeHost> {
     agents: new Map(),
     status: (sessionID) => host.statuses.get(sessionID),
     session: {
-      get: async ({ sessionID }) => ({ id: sessionID, agent: host.agents.get(sessionID) }),
+      get: async ({ sessionID }) => ({ id: sessionID, agent: host.agents.get(sessionID) ?? "build" }),
       switchAgent: async ({ sessionID, agent }) => {
         host.agents.set(sessionID, agent)
       },

@@ -1,6 +1,6 @@
-import { afterEach, expect, test } from "bun:test"
+import { afterEach, expect, spyOn, test } from "bun:test"
 import { rm } from "node:fs/promises"
-import { executeReminder, isUsageLimitError, pauseReminder, beginSchedulerGeneration, reconcileReminder, scheduleTimer } from "./scheduler"
+import { executeReminder, pauseReminder, beginSchedulerGeneration, reconcileReminder, scheduleTimer } from "./scheduler"
 import { saveReminder, loadReminder } from "./storage"
 import { restoreReminders, createTools } from "./index"
 import { ReminderSchema, type PluginConfig, type Reminder, type State } from "./types"
@@ -19,19 +19,21 @@ async function createFixture(type: Reminder["type"]) {
   directories.push(host.directory)
   const state = createState(host.projectID)
   const reminder = createReminder(host.projectID, type)
+  host.agents.set(reminder.sessionID, "build")
   state.reminders.set(reminder.id, reminder)
   return { host, state, reminder }
 }
 
-test("scheduler forwards a captured reminder agent by switching the session agent", async () => {
+test("scheduler refuses a mismatched captured agent without switching or prompting", async () => {
   const { host, state, reminder } = await createFixture("one-time")
   reminder.agent = "agent-a"
+  let switches = 0
+  host.session.switchAgent = async () => { switches++ }
   await saveReminder(reminder, host)
   await executeReminder(reminder, host, state, config)
-  expect(host.agents.get(reminder.sessionID)).toBe("agent-a")
-  expect(host.prompts).toHaveLength(1)
-  expect(host.prompts[0]).toMatchObject({ sessionID: reminder.sessionID, text: "test prompt", delivery: "queue" })
-  expect(await loadReminder(reminder.id, host)).toBeNull()
+  expect(switches).toBe(0)
+  expect(host.prompts).toHaveLength(0)
+  expect((await loadReminder(reminder.id, host))?.status).toBe("paused")
 })
 
 test("scheduler does not switch the agent when it already matches", async () => {
@@ -68,6 +70,7 @@ for (const agent of ["build", "agent-b", "agent-a", "agent-c"]) {
   test(`monitor uses action model resolution without changing originating ${agent} authority`, async () => {
     const { host, state, reminder } = await createFixture("one-time")
     reminder.agent = agent
+    host.agents.set(reminder.sessionID, agent)
     reminder.execution = "monitor"
     await saveReminder(reminder, host)
     await executeReminder(reminder, host, state, config)
@@ -209,30 +212,6 @@ for (const failure of ["throw", "wait-throw", "assistant-error"]) {
   })
 }
 
-test("aborted action turns reschedule recurring reminders and drop one-time ones", async () => {
-  for (const type of ["recurring", "one-time"] as const) {
-    const { host, state, reminder } = await createFixture(type)
-    reminder.agent = "build"
-    host.contextFor = (sessionID) => {
-      const messages = matchedContext(host, sessionID)
-      messages[1]!.error = { _tag: "Session.InterruptedError" }
-      return messages
-    }
-    await saveReminder(reminder, host)
-    const occurrence = reminder.time.nextExecution
-    await executeReminder(reminder, host, state, config)
-    const stored = await loadReminder(reminder.id, host)
-    if (type === "recurring") {
-      expect(stored?.status).toBe("active")
-      expect(stored!.time.nextExecution).toBeGreaterThan(occurrence)
-      expect(stored?.time.lastExecution).toBeUndefined()
-      beginSchedulerGeneration(host)
-    } else {
-      expect(stored).toBeNull()
-    }
-  }
-})
-
 test("same occurrence lease prevents overlapping monitor prompts", async () => {
   const { host, state, reminder } = await createFixture("recurring")
   reminder.agent = "build"
@@ -360,82 +339,6 @@ test("pause during session verification prevents admission", async () => {
   expect((await loadReminder(reminder.id, host))?.status).toBe("paused")
 })
 
-function failTurns(host: FakeHost, message = "Claude Code exited without a result (code 1)") {
-  host.contextFor = (sessionID) => {
-    const messages = matchedContext(host, sessionID)
-    messages[1]!.error = { type: "provider.unknown", message }
-    return messages
-  }
-}
-
-test("a failed recurring action turn reschedules to its next interval and counts the failure", async () => {
-  const { host, state, reminder } = await createFixture("recurring")
-  reminder.interval = 45 * 60_000
-  failTurns(host)
-  await saveReminder(reminder, host)
-  const before = Date.now()
-  await executeReminder(reminder, host, state, config)
-  const stored = await loadReminder(reminder.id, host)
-  expect(stored?.status).toBe("active")
-  expect(stored?.consecutiveFailures).toBe(1)
-  expect(stored!.time.nextExecution).toBeGreaterThanOrEqual(before + reminder.interval)
-  expect(stored?.time.lastExecution).toBeUndefined()
-  expect(state.timers.has(reminder.id)).toBe(true)
-  expect(state.reminders.get(reminder.id)?.consecutiveFailures).toBe(1)
-  beginSchedulerGeneration(host)
-})
-
-test("thrown prompt failures also reschedule recurring actions", async () => {
-  const { host, state, reminder } = await createFixture("recurring")
-  reminder.interval = 60_000
-  host.session.prompt = async () => { throw new Error("Server unavailable") }
-  await saveReminder(reminder, host)
-  await executeReminder(reminder, host, state, config)
-  const stored = await loadReminder(reminder.id, host)
-  expect(stored?.status).toBe("active")
-  expect(stored?.consecutiveFailures).toBe(1)
-  beginSchedulerGeneration(host)
-})
-
-test("recurring action pauses after the configured number of consecutive failures", async () => {
-  const { host, state, reminder } = await createFixture("recurring")
-  reminder.interval = 60_000
-  const limited: PluginConfig = { ...config, max_consecutive_failures: 3 }
-  failTurns(host)
-  await saveReminder(reminder, host)
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    const current = (await loadReminder(reminder.id, host))!
-    await executeReminder(current, host, state, limited)
-  }
-  const stored = await loadReminder(reminder.id, host)
-  expect(host.prompts).toHaveLength(3)
-  expect(stored?.status).toBe("paused")
-  expect(stored?.consecutiveFailures).toBe(3)
-  expect(stored?.pauseReason).toContain("3 consecutive failed turns")
-  expect(stored?.pauseReason).toContain("exited without a result")
-  expect(state.timers.has(reminder.id)).toBe(false)
-  expect(state.reminders.get(reminder.id)?.status).toBe("paused")
-  // A paused reminder never runs again.
-  await executeReminder(stored!, host, state, limited)
-  expect(host.prompts).toHaveLength(3)
-  const tools = Object.fromEntries(createTools(host, state, () => limited).map((tool) => [tool.name, tool]))
-  const listing = await tools.reminderlist.execute({}, { sessionID: reminder.sessionID, agent: "build" })
-  expect(listing.content).toContain("Paused automatically after 3 consecutive failed turns")
-})
-
-test("the default failure limit is five", async () => {
-  const { host, state, reminder } = await createFixture("recurring")
-  reminder.interval = 60_000
-  failTurns(host)
-  await saveReminder(reminder, host)
-  for (let attempt = 1; attempt <= 4; attempt++) {
-    await executeReminder((await loadReminder(reminder.id, host))!, host, state, config)
-  }
-  expect((await loadReminder(reminder.id, host))?.status).toBe("active")
-  await executeReminder((await loadReminder(reminder.id, host))!, host, state, config)
-  expect((await loadReminder(reminder.id, host))?.status).toBe("paused")
-})
-
 test("a successful turn resets the consecutive failure count", async () => {
   const { host, state, reminder } = await createFixture("recurring")
   reminder.interval = 60_000
@@ -447,32 +350,6 @@ test("a successful turn resets the consecutive failure count", async () => {
   expect(stored?.consecutiveFailures).toBeUndefined()
   expect(stored?.time.lastExecution).toBeNumber()
   beginSchedulerGeneration(host)
-})
-
-test("interrupted turns neither count nor reset the failure streak", async () => {
-  const { host, state, reminder } = await createFixture("recurring")
-  reminder.interval = 60_000
-  reminder.consecutiveFailures = 2
-  host.contextFor = (sessionID) => {
-    const messages = matchedContext(host, sessionID)
-    messages[1]!.error = { _tag: "Session.InterruptedError" }
-    return messages
-  }
-  await saveReminder(reminder, host)
-  await executeReminder(reminder, host, state, config)
-  const stored = await loadReminder(reminder.id, host)
-  expect(stored?.status).toBe("active")
-  expect(stored?.consecutiveFailures).toBe(2)
-  beginSchedulerGeneration(host)
-})
-
-test("a failed one-time action is still dropped", async () => {
-  const { host, state, reminder } = await createFixture("one-time")
-  failTurns(host)
-  await saveReminder(reminder, host)
-  await executeReminder(reminder, host, state, config)
-  expect(await loadReminder(reminder.id, host)).toBeNull()
-  expect(state.reminders.has(reminder.id)).toBe(false)
 })
 
 test("reminder schema keeps consecutive failures compatible with older snapshots", () => {
@@ -509,35 +386,98 @@ test("restore keeps failure counts on active reminders and leaves failure-paused
   beginSchedulerGeneration(host)
 })
 
-test("usage-limit failures reschedule without counting towards the pause", async () => {
-  const { host, state, reminder } = await createFixture("recurring")
-  reminder.interval = 60_000
-  reminder.consecutiveFailures = 2
-  const limited: PluginConfig = { ...config, max_consecutive_failures: 3 }
-  for (const message of [
-    "Claude Code: You've hit your session limit · resets 3:10am (UTC)",
-    "Claude Code: usage limit reached (session limit) - Claude is not started again until it resets 3:10am",
-  ]) {
-    failTurns(host, message)
-    await saveReminder(reminder, host)
-    const before = Date.now()
-    await executeReminder((await loadReminder(reminder.id, host))!, host, state, limited)
-    const stored = await loadReminder(reminder.id, host)
-    expect(stored?.status).toBe("active")
-    expect(stored?.consecutiveFailures).toBe(2)
-    expect(stored!.time.nextExecution).toBeGreaterThanOrEqual(before + reminder.interval)
-  }
-  // An ordinary failure still counts, and here reaches the limit.
-  failTurns(host)
-  await executeReminder((await loadReminder(reminder.id, host))!, host, state, limited)
-  expect((await loadReminder(reminder.id, host))?.status).toBe("paused")
+
+test("a long timer is clamped and re-armed when it fires before its due time", async () => {
+  const { host, state, reminder } = await createFixture("one-time")
+  reminder.time.nextExecution = Date.now() + 30 * 24 * 60 * 60_000
+  await scheduleTimer(reminder, host, state, config)
+  const timer = state.timers.get(reminder.id)! as any
+  expect(timer._idleTimeout).toBe(2_147_483_647)
+  clearTimeout(timer)
+  await timer._onTimeout()
+  expect(host.prompts).toHaveLength(0)
+  expect(state.timers.get(reminder.id)).toBeDefined()
+  expect((await loadReminder(reminder.id, host))?.status).toBe("active")
+  beginSchedulerGeneration(host)
 })
 
-test("usage-limit errors are told apart from other failures", () => {
-  expect(isUsageLimitError(new Error("Reminder turn failed: Claude Code: You've hit your weekly limit · resets Oct 5, 3am"))).toBe(true)
-  expect(isUsageLimitError(new Error("Reminder turn failed: Usage limit reached"))).toBe(true)
-  expect(isUsageLimitError(new Error("Reminder turn failed: Claude Code: Prompt is too long"))).toBe(false)
-  expect(isUsageLimitError(new Error("You've hit your monthly spend limit."))).toBe(false)
-  expect(isUsageLimitError(new Error("Server unavailable"))).toBe(false)
-  expect(isUsageLimitError(undefined)).toBe(false)
+test("a clamped timer executes only once the due time has arrived", async () => {
+  const { host, state, reminder } = await createFixture("one-time")
+  reminder.time.nextExecution = Date.now() + 30 * 24 * 60 * 60_000
+  await scheduleTimer(reminder, host, state, config)
+  const timer = state.timers.get(reminder.id)! as any
+  clearTimeout(timer)
+  const clock = spyOn(Date, "now").mockReturnValue(reminder.time.nextExecution)
+  try {
+    await timer._onTimeout()
+    expect(host.prompts).toHaveLength(1)
+    expect(await loadReminder(reminder.id, host)).toBeNull()
+  } finally {
+    clock.mockRestore()
+    beginSchedulerGeneration(host)
+  }
+})
+
+test("a failed one-time action remains paused for inspection", async () => {
+  const { host, state, reminder } = await createFixture("one-time")
+  host.session.prompt = async () => { throw new Error("Admission uncertain") }
+  await saveReminder(reminder, host)
+  await executeReminder(reminder, host, state, config)
+  expect((await loadReminder(reminder.id, host))?.status).toBe("paused")
+  expect(state.timers.size).toBe(0)
+})
+
+for (const mode of ["later-failure", "intervening-user", "later-incomplete"] as const) {
+  test(`full turn ${mode} pauses without crediting completion`, async () => {
+    const { host, state, reminder } = await createFixture("recurring")
+    host.contextFor = (sessionID) => {
+      const messages = matchedContext(host, sessionID)
+      if (mode === "intervening-user") messages.push({ id: nextMessageID(), type: "user" })
+      messages.push({ id: nextMessageID(), type: "assistant", time: mode === "later-incomplete" ? {} : { completed: Date.now() }, ...(mode === "later-failure" ? { error: { message: "failed" } } : {}) })
+      return messages
+    }
+    await saveReminder(reminder, host)
+    await executeReminder(reminder, host, state, config)
+    const saved = await loadReminder(reminder.id, host)
+    expect(saved?.status).toBe("paused")
+    expect(saved?.time.lastExecution).toBeUndefined()
+    expect(state.timers.size).toBe(0)
+  })
+}
+
+test("reload after admission leaves the occurrence paused rather than replaying it", async () => {
+  const { host, state, reminder } = await createFixture("recurring")
+  let entered!: () => void
+  let release!: () => void
+  const enteredWait = new Promise<void>((resolve) => { entered = resolve })
+  const wait = new Promise<void>((resolve) => { release = resolve })
+  host.session.wait = async () => { entered(); await wait }
+  await saveReminder(reminder, host)
+  const running = executeReminder(reminder, host, state, config)
+  await enteredWait
+  expect(host.prompts).toHaveLength(1)
+  const generation = beginSchedulerGeneration(host)
+  const replacement: State = { ...createState(host.projectID), generation }
+  expect(await restoreReminders(host, replacement, config, generation)).toBe(true)
+  expect(replacement.reminders.get(reminder.id)?.status).toBe("paused")
+  expect(replacement.timers.size).toBe(0)
+  await executeReminder((await loadReminder(reminder.id, host))!, host, replacement, config)
+  expect(host.prompts).toHaveLength(1)
+  release()
+  await running
+  expect((await loadReminder(reminder.id, host))?.status).toBe("paused")
+  beginSchedulerGeneration(host)
+})
+
+test("a busy session with a different agent is never switched or prompted", async () => {
+  const { host, state, reminder } = await createFixture("recurring")
+  reminder.agent = "agent-a"
+  host.statuses.set(reminder.sessionID, "busy")
+  let switches = 0
+  host.session.switchAgent = async () => { switches++ }
+  await saveReminder(reminder, host)
+  await executeReminder(reminder, host, state, config)
+  expect(switches).toBe(0)
+  expect(host.prompts).toHaveLength(0)
+  expect((await loadReminder(reminder.id, host))?.status).toBe("paused")
 })

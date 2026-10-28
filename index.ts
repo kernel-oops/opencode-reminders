@@ -1,6 +1,6 @@
 import { logger } from "./logger"
 import type { State, PluginConfig } from "./types"
-import { DEFAULT_MAX_CONSECUTIVE_FAILURES, ReminderSchema } from "./types"
+import { ReminderSchema } from "./types"
 import { createHost, type PluginContextLike, type ReminderHost } from "./host"
 import { getStorageDir, listReminders } from "./storage"
 import {
@@ -27,7 +27,6 @@ const DEFAULT_CONFIG: PluginConfig = {
   enabled: true,
   max_reminders_per_project: 50,
   min_interval_seconds: 30,
-  max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
 }
 
 function readConfig(options: Record<string, unknown> | undefined): PluginConfig {
@@ -39,9 +38,6 @@ function readConfig(options: Record<string, unknown> | undefined): PluginConfig 
   }
   if (typeof options.min_interval_seconds === "number" && options.min_interval_seconds >= 30) {
     config.min_interval_seconds = Math.floor(options.min_interval_seconds)
-  }
-  if (typeof options.max_consecutive_failures === "number" && options.max_consecutive_failures >= 1) {
-    config.max_consecutive_failures = Math.floor(options.max_consecutive_failures)
   }
   return config
 }
@@ -75,8 +71,7 @@ export async function restoreReminders(host: ReminderHost, state: State, config:
     const reminder = parsed.data
     try {
       if (reminder.status === "paused") {
-        // Includes reminders paused automatically after repeated failed turns; they keep
-        // their reason and failure count and never resume on their own.
+        // Paused snapshots retain their reason and never resume automatically.
         state.reminders.set(reminder.id, reminder)
         continue
       }
@@ -90,8 +85,7 @@ export async function restoreReminders(host: ReminderHost, state: State, config:
         continue
       }
 
-      // An active reminder keeps its consecutive failure count across restarts, so a
-      // reload between failed turns cannot reset the pause threshold.
+      // Preserve historical failure counts when restoring old snapshots.
       state.reminders.set(reminder.id, reminder)
       const scheduled = await scheduleTimer(reminder, host, state, config, { persist: false, skipOverdue: true })
       if (!isSchedulerGenerationCurrent(host, generation)) return false

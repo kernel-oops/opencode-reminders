@@ -10,8 +10,7 @@ export type Reminder = {
   execution?: "action" | "monitor"
   pauseReason?: string
   /**
-   * Consecutive failed turns of a recurring action reminder. Absent (or 0) after a
-   * successful turn; older snapshots without the field read as 0.
+   * Historical failure count retained when reading older snapshots.
    */
   consecutiveFailures?: number
   time: {
@@ -33,15 +32,6 @@ export type PluginConfig = {
   enabled: boolean
   max_reminders_per_project: number
   min_interval_seconds: number
-  /** Consecutive failed turns before a recurring action reminder is paused (default 5). */
-  max_consecutive_failures?: number
-}
-
-export const DEFAULT_MAX_CONSECUTIVE_FAILURES = 5
-
-export function maxConsecutiveFailures(config: PluginConfig): number {
-  const value = config.max_consecutive_failures
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 ? value : DEFAULT_MAX_CONSECUTIVE_FAILURES
 }
 
 type ParseResult = { success: true; data: Reminder } | { success: false; error: string }
