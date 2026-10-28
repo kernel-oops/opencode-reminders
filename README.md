@@ -7,7 +7,7 @@ Schedule one-time or recurring prompts in OpenCode sessions. This is a maintaine
 ```json
 {
   "plugins": [
-    { "package": "./plugins/opencode-reminders/index.ts", "options": {
+    { "package": "./plugins/opencode-reminders", "options": {
       "max_reminders_per_project": 50,
       "min_interval_seconds": 30
     } }
@@ -26,7 +26,7 @@ Ask the assistant to schedule, list, pause or remove a reminder. The plugin regi
 ## Important limits
 
 - Prompts use queued delivery rather than interrupting an active turn. Session busy status comes from observed events; it is not a status query.
-- The v2 API has no per-prompt agent argument. The plugin never switches a session agent: a captured-agent mismatch pauses the reminder. Agent verification and prompt admission are not atomic, so another actor can still change the session agent between them. Legacy reminders without a captured agent use the current session agent. Completion is conservatively checked against all messages after the admitted user message; intervening user messages or incomplete or failed assistant messages pause the reminder rather than crediting it.
+- The v2 API has no per-prompt agent argument. The plugin never switches a session agent: a captured-agent mismatch pauses the reminder. Agent verification and prompt admission are not atomic, so another actor can still change the session agent between them. Legacy reminders without a captured agent use the current session agent. Completion is conservatively checked against all messages after the admitted user message; intervening user messages, incomplete or failed assistant messages, and missing or unsuccessful terminal idle markers pause the reminder rather than crediting it.
 - Server-side toast notifications are unavailable; legacy notification options are ignored.
 - Before admission, the occurrence is durably paused as an in-flight guard. A successful, unambiguous completion clears it; a process crash, reload, admission error or ambiguous completion leaves it paused for manual inspection, even if no prompt was actually admitted. This favours avoiding duplicate submissions over guaranteed delivery and is not exactly-once delivery. Storage writes are not fsynced: an OS or power failure may lose the guard and allow a duplicate. Cancellation cannot retract a prompt already admitted. Leases and guards require same-host local filesystem operations, not distributed filesystems; a stale recovery guard may require manual cleanup.
 - Reminders are best-effort and depend on the server running. They are not guaranteed OS-level alarms.

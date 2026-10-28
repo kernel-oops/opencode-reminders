@@ -427,13 +427,15 @@ test("a failed one-time action remains paused for inspection", async () => {
   expect(state.timers.size).toBe(0)
 })
 
-for (const mode of ["later-failure", "intervening-user", "later-incomplete"] as const) {
+for (const mode of ["later-failure", "intervening-user", "later-incomplete", "finish-error", "steered"] as const) {
   test(`full turn ${mode} pauses without crediting completion`, async () => {
     const { host, state, reminder } = await createFixture("recurring")
     host.contextFor = (sessionID) => {
       const messages = matchedContext(host, sessionID)
-      if (mode === "intervening-user") messages.push({ id: nextMessageID(), type: "user" })
-      messages.push({ id: nextMessageID(), type: "assistant", time: mode === "later-incomplete" ? {} : { completed: Date.now() }, ...(mode === "later-failure" ? { error: { message: "failed" } } : {}) })
+      if (mode === "finish-error") messages[1]!.finish = "error"
+      if (mode === "steered") messages[1]!.interruption = "steer"
+      if (mode === "intervening-user") messages.splice(-1, 0, { id: nextMessageID(), type: "user", time: { created: Date.now() } })
+      messages.splice(-1, 0, { id: nextMessageID(), type: "assistant", time: mode === "later-incomplete" ? { created: Date.now() } : { created: Date.now(), completed: Date.now() }, ...(mode === "later-failure" ? { error: { message: "failed" } } : {}) })
       return messages
     }
     await saveReminder(reminder, host)
@@ -481,3 +483,42 @@ test("a busy session with a different agent is never switched or prompted", asyn
   expect(host.prompts).toHaveLength(0)
   expect((await loadReminder(reminder.id, host))?.status).toBe("paused")
 })
+
+test("stock v2 multi-step assistant sequence followed by successful idle is credited", async () => {
+  const { host, state, reminder } = await createFixture("recurring")
+  reminder.interval = 60_000
+  host.contextFor = (sessionID) => {
+    const messages = matchedContext(host, sessionID)
+    messages[1]!.finish = "tool-calls"
+    messages.splice(-1, 0, { id: nextMessageID(), type: "assistant", agent: "build", model: { id: "test", providerID: "test" }, content: [{ type: "text", text: "done" }], finish: "stop", time: { created: Date.now(), completed: Date.now() } })
+    return messages
+  }
+  await saveReminder(reminder, host)
+  await executeReminder(reminder, host, state, config)
+  const saved = await loadReminder(reminder.id, host)
+  expect(saved?.status).toBe("active")
+  expect(saved?.time.lastExecution).toBeNumber()
+  expect(state.timers.has(reminder.id)).toBe(true)
+  beginSchedulerGeneration(host)
+})
+
+for (const mode of ["failed", "interrupted", "missing", "user-after-idle", "duplicate-idle", "no-assistant"] as const) {
+  test(`v2 idle boundary ${mode} is not credited`, async () => {
+    const { host, state, reminder } = await createFixture("recurring")
+    host.contextFor = (sessionID) => {
+      const messages = matchedContext(host, sessionID)
+      if (mode === "failed" || mode === "interrupted") messages[messages.length - 1]!.outcome = mode
+      if (mode === "missing") messages.pop()
+      if (mode === "user-after-idle") messages.push({ id: nextMessageID(), type: "user", time: { created: Date.now() } })
+      if (mode === "duplicate-idle") messages.push({ id: nextMessageID(), type: "idle", outcome: "succeeded", time: { created: Date.now() } })
+      if (mode === "no-assistant") messages.splice(1, 1)
+      return messages
+    }
+    await saveReminder(reminder, host)
+    await executeReminder(reminder, host, state, config)
+    const saved = await loadReminder(reminder.id, host)
+    expect(saved?.status).toBe("paused")
+    expect(saved?.time.lastExecution).toBeUndefined()
+    expect(state.timers.size).toBe(0)
+  })
+}

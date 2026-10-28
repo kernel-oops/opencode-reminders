@@ -9,6 +9,13 @@ export type SessionMessage = {
   type: string
   time?: { created?: unknown; completed?: unknown }
   error?: unknown
+  text?: string
+  agent?: string
+  model?: { id: string; providerID: string; variant?: string }
+  content?: ReadonlyArray<unknown>
+  finish?: "stop" | "length" | "tool-calls" | "content-filter" | "error" | "unknown"
+  interruption?: "steer"
+  outcome?: "succeeded" | "failed" | "interrupted"
 }
 
 export type PromptRequest = {

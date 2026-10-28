@@ -19,8 +19,9 @@ export function matchedContext(host: FakeHost, sessionID: string): SessionMessag
   const last = [...host.prompts].reverse().find((p) => p.sessionID === sessionID)
   if (!last?.id) return []
   return [
-    { id: last.id, type: "user" },
-    { id: nextMessageID(), type: "assistant", time: { created: Date.now(), completed: Date.now() } },
+    { id: last.id, type: "user", text: last.text, time: { created: Date.now() } },
+    { id: nextMessageID(), type: "assistant", agent: "build", model: { id: "test", providerID: "test" }, content: [{ type: "text", text: "done" }], finish: "stop", time: { created: Date.now(), completed: Date.now() } },
+    { id: nextMessageID(), type: "idle", outcome: "succeeded", time: { created: Date.now() } },
   ]
 }
 

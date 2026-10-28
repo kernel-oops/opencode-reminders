@@ -489,11 +489,13 @@ async function runPrompt(
   const index = messages.findIndex((message) => message.id === admitted.id)
   const unique = messages.filter((message) => message.id === admitted.id).length === 1
   const tail = messages.slice(index + 1)
-  if (index < 0 || !unique || messages[index]?.type !== "user" || tail.length === 0 || tail.some((message) => message.type !== "assistant" || !message.time?.completed)) {
-    throw new ReminderPromptError("Reminder completion is ambiguous; inspect the session", "unmatched")
+  const idle = tail.at(-1)
+  const assistants = tail.slice(0, -1)
+  if (index < 0 || !unique || messages[index]?.type !== "user" || idle?.type !== "idle" || idle.outcome !== "succeeded" || assistants.length === 0 || assistants.some((message) => message.type !== "assistant" || !message.time?.completed)) {
+    throw new ReminderPromptError("Reminder completion is ambiguous or not successful; inspect the session", "unmatched")
   }
-  for (const assistant of tail) {
-    if (assistant.error !== undefined) {
+  for (const assistant of assistants) {
+    if (assistant.error !== undefined || assistant.finish === "error" || assistant.interruption !== undefined) {
       const detail = assistantErrorText(assistant.error)
       throw new ReminderPromptError(detail ? `Reminder turn failed: ${detail}` : "Reminder turn failed", errorIsAbort(assistant.error) ? "aborted" : "failed")
     }
