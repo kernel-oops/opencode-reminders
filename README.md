@@ -1,225 +1,39 @@
-# OpenCode Reminders Plugin
+# OpenCode Reminders for v2
 
-Schedule actions to run at intervals in OpenCode sessions. Set one-time or recurring reminders that execute prompts automatically.
+Schedule one-time or recurring prompts in OpenCode sessions. This is a maintained v2 fork of [Dmitry Zelenkovsky's opencode-reminders](https://github.com/zelenkovsky/opencode-reminders); thank you to Dmitry for creating the original plugin. The original and this fork are MIT licensed.
 
-## Features
-
-- ⏰ **One-time reminders** - Execute an action after a delay
-- 🔄 **Recurring reminders** - Execute an action at regular intervals
-- 💾 **Persistent** - Survives OpenCode restarts
-- 🧹 **Auto-cleanup** - Removes reminders when sessions are deleted
-- 🔒 **Session-scoped** - Reminders tied to specific sessions
-
-## Installation
-
-```bash
-bun install opencode-reminders
-```
-
-Then add to your `opencode.json`:
+**This branch is an OpenCode v2 port, not the v1 npm release.** It has not been published as v2; do not assume `bun install opencode-reminders` installs this version. It has no runtime dependencies. For an existing installation, make a reviewed local copy of this repository available to the server and register its entry point in the v2 configuration. For example, relative to the configuration directory:
 
 ```json
 {
-  "plugin": [
-    "opencode-reminders"
+  "plugins": [
+    { "package": "./plugins/opencode-reminders/index.ts", "options": {
+      "max_reminders_per_project": 50,
+      "min_interval_seconds": 30,
+      "max_consecutive_failures": 5
+    } }
   ]
 }
 ```
 
-OpenCode will automatically load the plugin when you start the TUI.
+Restart the server after installing or changing the plugin. Check the host's own v2 plugin configuration and loading rules before deployment; no automatic migration or deployment is provided here. Do not load this port on a v1 server.
 
-## Usage
+## Use
 
-### Set a Reminder
+Ask the assistant to schedule, list, pause or remove a reminder. The plugin registers `reminderadd`, `reminderlist`, `reminderpause` and `reminderremove`. Intervals are at least 30 seconds. Reminders are persisted per project under `.opencode/reminders/`; prompts are delivered to their original session. Paused reminders do not automatically resume.
 
-**One-time (execute once after delay):**
+`reminderadd` defaults to an **action**; `execution: "monitor"` is for an explicitly authorised, bounded routine check. Monitor mode retains the original session and captured agent, with ordinary model and permission resolution; it does not guarantee a cheaper model or authorise follow-on work. Monitors suspend when their execution cannot be verified. Recurring actions pause after the configured number of consecutive failures; provider usage-limit failures are not counted.
 
-```
-"In 5 minutes, check the build status"
-```
+## Important limits
 
-**Recurring (execute repeatedly):**
+- Prompts use queued delivery rather than interrupting an active turn. Session busy status comes from observed events; it is not a status query.
+- The v2 API has no per-prompt agent argument: the port may switch the session's agent before delivery. It matches completion using the session context after waiting. This is not identical to v1's message-level agent and reply matching.
+- Server-side toast notifications are unavailable; legacy notification options are ignored.
+- Leases coordinate processes on the same host using local filesystem operations, not distributed filesystems. Delivery is **at least once**, not exactly once: crashes can cause a retry after a prompt was accepted. Cancellation cannot retract a prompt already admitted. A stale recovery guard may require manual cleanup.
+- Reminders are best-effort and depend on the server running. They are not guaranteed OS-level alarms.
 
-```
-"Every hour, check for new emails and summarize them"
-```
-
-### List Reminders
-
-```
-"What reminders do I have?"
-"Show my active reminders"
-```
-
-### Remove a Reminder
-
-```
-"Stop checking my email"
-"Cancel the build status reminder"
-```
-
-## How It Works
-
-1. **Storage** - Reminders saved as JSON files in `.opencode/reminders/<project-id>/`
-2. **Scheduling** - Uses `setTimeout` to schedule executions
-3. **Execution** - Sends prompt to session when timer fires
-4. **Cleanup** - Removes reminders when session deleted
-
-## Multi-Process Semantics
-
-When independent OpenCode server processes load the same reminder directory on one host, an
-occurrence lease prevents them from submitting the same prompt concurrently. Leases and reminder
-JSON updates use same-directory atomic filesystem operations. A losing process keeps an unref'd
-reconciliation timer, reloads durable state, and schedules the winner's next recurring occurrence.
-Post-prompt recurrence updates and every plugin cancellation/restore cleanup share a short-lived
-per-reminder mutation lock, so the durable read-and-transition cannot race a deletion. The lock is
-not held while the prompt API runs.
-
-Reconciliation retries use capped exponential backoff. A recurring occurrence found overdue during
-startup retains its skip-overdue policy across read or atomic-write failures, so unchanged old JSON
-is never reinterpreted as a normal occurrence and prompted. Normal runtime failures retain the
-occurrence for an at-least-once retry; the retry history resets after durable state advances into the
-future.
-
-Within one server process, plugin generations also fence hot reloads. Reinitialization clears old
-timers, aborts active requests, waits for mutations already in progress, and prevents stale timer or
-reconciliation callbacks from changing replacement state. Cancellation aborts the active local
-request immediately, then uses the same mutation lock as cross-process transitions.
-
-Reconciliation reads are fenced per reminder and revalidated under the mutation lock. Once local
-cancellation returns, a read that completed before deletion cannot restore stale list state or a
-timer, even if its continuation resumes later.
-
-If durable cancellation fails, the plugin re-reads authoritative state through the same fence and
-lock protocol, restores a delayed timer, and returns the original deletion error. The reminder stays
-visible and can be cancelled again without restarting the server.
-
-This is deliberately not a claim of crash-proof exactly-once delivery. Any process, storage, or lock
-failure after the prompt API accepts a request but before its durable transition can lead to retry.
-That is at-least-once crash semantics; true exactly-once delivery requires idempotency support in the
-prompt API. Likewise, cancellation does not hold a lock across prompting: if an owner has already
-passed durable validation, a prompt can still be submitted even when cancellation returns first.
-The post-prompt durable transition remains fenced, so cancellation cannot intentionally resurrect or
-reschedule the reminder after deletion.
-
-The lease protocol assumes same-host processes and a local filesystem with atomic hard links,
-exclusive create, and rename. It is not intended to coordinate hosts or provide NFS/distributed
-filesystem safety. Linux detects a dead or reused PID using `/proc/<pid>/stat` process start time.
-Other platforms may acquire leases normally, but only reclaim a lease when `process.kill(pid, 0)`
-reports `ESRCH`; a reused PID is conservatively treated as live and can leave a stale lease until
-manual cleanup rather than risk a duplicate prompt.
-
-A stale `.recover` guard is never reclaimed automatically. This avoids a replacement race that could
-delete a live guard or lease, at the cost of manual cleanup after a recovery-process crash.
-
-Reminders capture the creating tool context's optional agent name and pass it back to the prompt API
-when they execute. Existing reminder files without `agent` remain valid and omit the prompt field.
-
-## Data Storage
-
-Reminders stored in:
-
-```
-.opencode/
-  reminders/
-    <project-id>/
-      <reminder-id>.json
-    .gitignore
-```
-
-The `.gitignore` file is automatically created to exclude reminder data from version control.
-
-## Configuration
-
-The plugin supports the following configuration options (set via plugin config):
-
-```typescript
-{
-  reminders: {
-    enabled: true,                    // Enable/disable plugin
-    max_reminders_per_project: 50,    // Maximum reminders per project
-    min_interval_seconds: 30,         // Minimum interval between executions
-    notifications: {
-      enabled: true                   // Enable/disable toast notifications
-    }
-  }
-}
-```
+See [VENDORED.md](VENDORED.md) for the v2 mapping, behavioural gaps and the provenance of this port. The focused tests are not a full replacement for the original v1 test suite or proof of compatibility with every v2 server build.
 
 ## Development
 
-### Install Dependencies
-
-```bash
-bun install
-```
-
-### Type Check
-
-```bash
-tsc --noEmit
-```
-
-### Run Tests
-
-```bash
-# Run all tests
-bun test
-
-# Run specific test suites
-bun test test/types.test.ts
-bun test test/storage.test.ts
-bun test test/logger.test.ts
-bun test test/config.test.ts
-bun test test/scheduler.test.ts
-bun test test/integration.test.ts
-
-# Watch mode
-bun test --watch
-
-# Using npm scripts
-npm run test
-npm run test:types
-npm run test:storage
-npm run test:logger
-npm run test:integration
-npm run test:watch
-```
-
-**Test Coverage:** Comprehensive test suite covering types, storage, logging, configuration, scheduling, and integration.
-
-## Architecture
-
-This plugin demonstrates a multi-file structure:
-
-- **`index.ts`** - Main plugin export with tool definitions and event handlers
-- **`types.ts`** - TypeScript types and Zod schemas
-- **`storage.ts`** - Filesystem operations for persistence
-- **`scheduler.ts`** - Timer management and execution logic
-- **`logger.ts`** - Logging functionality with configurable levels
-- **`tools/`** - Tool implementations (reminderadd, reminderlist, reminderremove)
-- **`test/`** - Comprehensive test suite
-- **`package.json`** - Dependencies configuration
-- **`tsconfig.json`** - TypeScript configuration
-
-## Troubleshooting
-
-**Reminders not executing?**
-
-- Check session still exists
-- Verify reminder shows in list
-- Check console for errors
-
-**Reminders lost after restart?**
-
-- Ensure storage directory not deleted
-- Check file permissions
-
-**Too many reminders?**
-
-- Default limit: 50 per session
-- Remove old reminders before adding new ones
-
-## License
-
-MIT
+Run `bun test` with Bun. The tests use fake hosts and temporary storage; they do not exercise a live provider or deploy the plugin.

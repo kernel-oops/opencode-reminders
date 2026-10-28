@@ -1,57 +1,66 @@
-import { tool, type PluginInput } from "@opencode-ai/plugin"
+import type { ReminderHost } from "../host"
 import type { PluginConfig, State } from "../types"
 import { cancelReminder } from "../scheduler"
 import DESCRIPTION from "./reminderremove.txt"
 import { logger } from "../logger"
+import type { ToolInfo } from "./tool"
 
 export function createReminderRemoveTool(
-  ctx: PluginInput,
+  host: ReminderHost,
   state: State,
   getConfig: () => PluginConfig,
-) {
-  return tool({
+): ToolInfo<{ description_pattern: string }> {
+  return {
+    name: "reminderremove",
     description: DESCRIPTION,
-
-    args: {
-      description_pattern: tool.schema
-        .string()
-        .describe("What the user wants to stop (will match against reminder descriptions)"),
+    input: {
+      type: "object",
+      properties: {
+        description_pattern: {
+          type: "string",
+          description: "What the user wants to stop (will match against reminder descriptions)",
+        },
+      },
+      required: ["description_pattern"],
+      additionalProperties: false,
     },
 
     async execute(args, context) {
       const reminders = Array.from(state.reminders.values()).filter(
-        (r) => r.sessionID === context.sessionID && r.status === "active",
+        (r) => r.sessionID === context.sessionID && r.status !== "cancelled",
       )
 
-      const pattern = args.description_pattern.toLowerCase()
+      const pattern = String(args.description_pattern ?? "").toLowerCase()
       const matches = reminders.filter(
-        (r) =>
-          r.userDescription.toLowerCase().includes(pattern) || r.originalPrompt.toLowerCase().includes(pattern),
+        (r) => r.userDescription.toLowerCase().includes(pattern) || r.originalPrompt.toLowerCase().includes(pattern),
       )
 
       if (matches.length === 0) {
         const activeList = reminders.map((r) => `- ${r.userDescription}`).join("\n") || "None"
-        return `No matching reminder found for "${args.description_pattern}". Active reminders:\n${activeList}`
+        return { content: `No matching reminder found for "${args.description_pattern}". Active reminders:\n${activeList}` }
       }
 
-      // Cancel all matching reminders
-      const cancelledDescriptions: string[] = []
+      const cancelledReminders = []
       for (const reminder of matches) {
-        if (await cancelReminder(reminder.id, ctx, state, getConfig())) {
-          cancelledDescriptions.push(reminder.userDescription)
+        if (await cancelReminder(reminder.id, host, state, getConfig())) {
+          cancelledReminders.push(reminder)
           logger.info(`[RemindersPlugin] Cancelled reminder ${reminder.id} via user request`)
         }
       }
 
-      if (cancelledDescriptions.length === 0) {
-        return "Reminder scheduler reloaded while cancelling. Check active reminders before retrying."
+      if (cancelledReminders.length === 0) {
+        return { content: "Reminder scheduler reloaded while cancelling. Check active reminders before retrying." }
       }
-      if (cancelledDescriptions.length === 1) {
-        return `Reminder cancelled: ${cancelledDescriptions[0]}`
-      } else {
-        const cancelledList = cancelledDescriptions.map((desc) => `- ${desc}`).join("\n")
-        return `${cancelledDescriptions.length} reminders cancelled:\n${cancelledList}`
+      const metadata = {
+        title: `🗑️ ${cancelledReminders.length} reminder${cancelledReminders.length === 1 ? "" : "s"} cancelled`,
+        count: cancelledReminders.length,
+        cancelled: cancelledReminders.map((r) => ({ id: r.id, description: r.userDescription })),
       }
+      if (cancelledReminders.length === 1) {
+        return { content: `Reminder cancelled: ${cancelledReminders[0].userDescription}`, metadata }
+      }
+      const cancelledList = cancelledReminders.map((r) => `- ${r.userDescription}`).join("\n")
+      return { content: `${cancelledReminders.length} reminders cancelled:\n${cancelledList}`, metadata }
     },
-  })
+  }
 }

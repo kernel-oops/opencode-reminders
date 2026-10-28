@@ -40,4 +40,11 @@ Response Format:
 Usage notes:
   - Maximum reminders per project is configurable
   - Use description for matching when listing/removing reminders
-  - Reminders persist only for current session
+  - Reminders persist across restarts and are tied to the creating session
+
+
+Execution modes:
+- Omit execution (or use "action") for arbitrary scheduled actions and tasks needing normal controller reasoning. Existing reminders are unchanged.
+- Use execution="monitor" ONLY for a user-authorised, routine bounded status check, not an arbitrary action. Uses the originating agent and the same default model resolution as ordinary actions, original session and unchanged permissions; it does not delegate to another agent. No model/variant override and no cheaper-model guarantee. Full context still costs tokens. Known busy sessions defer; unknown status uses queued delivery. Unmatched completion suspends a monitor.
+- Monitor prompts require one short "No change." response for unchanged state, no duplicate workers/follow-on changes, and reminderpause BEFORE reporting an authorisation blocker once. Paused reminders survive reloads and require explicit removal/recreation after authorisation or a verified change. No permission is granted by this tool.
+- This is a behavioural monitoring contract, not a read-only sandbox or an automatic detector of authorisation blocks. If the suspension tool is unavailable/denied, do not promise automatic suspension.

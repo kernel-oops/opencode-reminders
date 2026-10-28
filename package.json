@@ -1,18 +1,24 @@
 {
   "name": "opencode-reminders",
-  "version": "1.0.2",
-  "description": "Reminder plugin for OpenCode - schedule actions to run at intervals",
-  "keywords": ["opencode", "reactive", "plugin", "reminders", "scheduler"],
-  "author": "zelenkovsky",
+  "version": "2.0.0",
+  "description": "OpenCode v2 reminder plugin",
+  "keywords": [
+    "opencode",
+    "reactive",
+    "plugin",
+    "reminders",
+    "scheduler"
+  ],
+  "author": "Dmitry Zelenkovsky",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/zelenkovsky/opencode-reminders"
+    "url": "https://github.com/kernel-oops/opencode-reminders.git"
   },
   "bugs": {
-    "url": "https://github.com/zelenkovsky/opencode-reminders/issues"
+    "url": "https://github.com/kernel-oops/opencode-reminders/issues"
   },
-  "homepage": "https://github.com/zelenkovsky/opencode-reminders#readme",
+  "homepage": "https://github.com/kernel-oops/opencode-reminders#readme",
   "type": "module",
   "main": "./index.ts",
   "exports": {
@@ -25,27 +31,21 @@
     "scheduler.ts",
     "leases.ts",
     "logger.ts",
-    "tools/",
-    "README.md"
+    "execution.ts",
+    "host.ts",
+    "tools/reminderadd.ts",
+    "tools/reminderadd.txt",
+    "tools/reminderlist.ts",
+    "tools/reminderlist.txt",
+    "tools/reminderpause.ts",
+    "tools/reminderremove.ts",
+    "tools/reminderremove.txt",
+    "tools/tool.ts",
+    "README.md",
+    "VENDORED.md",
+    "LICENSE.md"
   ],
   "scripts": {
-    "test": "bun test",
-    "test:types": "bun test test/types.test.ts",
-    "test:storage": "bun test test/storage.test.ts",
-    "test:logger": "bun test test/logger.test.ts",
-    "test:config": "bun test test/config.test.ts",
-    "test:scheduler": "bun test test/scheduler.test.ts",
-    "test:integration": "bun test test/integration.test.ts",
-    "test:watch": "bun test --watch"
-  },
-  "dependencies": {
-    "@opencode-ai/plugin": "^0.15.7",
-    "@opencode-ai/sdk": "^0.15.7",
-    "zod": "^4.1.8"
-  },
-  "devDependencies": {
-    "@types/bun": "^1.3.0",
-    "@types/node": "^22.13.9",
-    "typescript": "^5.8.2"
+    "test": "bun test"
   }
 }

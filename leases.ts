@@ -1,6 +1,6 @@
 import { link, open, readFile, rm } from "node:fs/promises"
 import path from "node:path"
-import type { PluginInput } from "@opencode-ai/plugin"
+import type { ReminderHost } from "./host"
 import { getStorageDir } from "./storage"
 
 type Owner = {
@@ -145,10 +145,10 @@ async function newOwner(): Promise<Owner> {
 export async function acquireExecutionLease(
   reminderID: string,
   occurrence: number,
-  ctx: PluginInput,
+  host: ReminderHost,
 ): Promise<LeaseAcquisition> {
   try {
-    const dir = await getStorageDir(ctx)
+    const dir = await getStorageDir(host)
     const leasePath = path.join(dir, `${reminderID}.${occurrence}.lease`)
     return await acquireOwnerLock(leasePath, await newOwner())
   } catch (error) {
@@ -156,8 +156,8 @@ export async function acquireExecutionLease(
   }
 }
 
-export async function acquireMutationLock(reminderID: string, ctx: PluginInput): Promise<ExecutionLease> {
-  const dir = await getStorageDir(ctx)
+export async function acquireMutationLock(reminderID: string, host: ReminderHost): Promise<ExecutionLease> {
+  const dir = await getStorageDir(host)
   const lockPath = path.join(dir, `${reminderID}.mutation.lock`)
   const owner = await newOwner()
   const deadline = Date.now() + MUTATION_LOCK_TIMEOUT_MS

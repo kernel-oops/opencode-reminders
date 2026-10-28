@@ -1,18 +1,19 @@
 import path from "path"
-import { open, readFile, rename, rm } from "node:fs/promises"
-import type { PluginInput } from "@opencode-ai/plugin"
+import { mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises"
+import type { ReminderHost } from "./host"
 import type { Reminder } from "./types"
 import { logger } from "./logger"
 
-export async function getStorageDir(ctx: PluginInput): Promise<string> {
-  const dir = path.join(ctx.directory, ".opencode", "reminders", ctx.project.id)
-  await ctx.$`mkdir -p ${dir}`.quiet()
-  await Bun.write(path.join(ctx.directory, ".opencode", "reminders", ".gitignore"), "*")
+export async function getStorageDir(host: Pick<ReminderHost, "directory" | "projectID">): Promise<string> {
+  const root = path.join(host.directory, ".opencode", "reminders")
+  const dir = path.join(root, host.projectID)
+  await mkdir(dir, { recursive: true })
+  await writeFile(path.join(root, ".gitignore"), "*")
   return dir
 }
 
-export async function saveReminder(reminder: Reminder, ctx: PluginInput): Promise<void> {
-  const dir = await getStorageDir(ctx)
+export async function saveReminder(reminder: Reminder, host: ReminderHost): Promise<void> {
+  const dir = await getStorageDir(host)
   const filePath = path.join(dir, `${reminder.id}.json`)
   const temporaryPath = path.join(dir, `.${reminder.id}.${crypto.randomUUID()}.tmp`)
   let handle
@@ -29,8 +30,8 @@ export async function saveReminder(reminder: Reminder, ctx: PluginInput): Promis
   }
 }
 
-export async function loadReminder(id: string, ctx: PluginInput): Promise<Reminder | null> {
-  const dir = await getStorageDir(ctx)
+export async function loadReminder(id: string, host: ReminderHost): Promise<Reminder | null> {
+  const dir = await getStorageDir(host)
   const filePath = path.join(dir, `${id}.json`)
 
   try {
@@ -41,20 +42,20 @@ export async function loadReminder(id: string, ctx: PluginInput): Promise<Remind
   }
 }
 
-export async function deleteReminder(id: string, ctx: PluginInput): Promise<void> {
-  const dir = await getStorageDir(ctx)
-  const filePath = path.join(dir, `${id}.json`)
-  await rm(filePath, { force: true })
+export async function deleteReminder(id: string, host: ReminderHost): Promise<void> {
+  const dir = await getStorageDir(host)
+  await rm(path.join(dir, `${id}.json`), { force: true })
 }
 
-export async function listReminders(ctx: PluginInput): Promise<Reminder[]> {
-  const dir = await getStorageDir(ctx)
+export async function listReminders(host: ReminderHost): Promise<Reminder[]> {
+  const dir = await getStorageDir(host)
   const reminders: Reminder[] = []
 
-  for await (const file of new Bun.Glob("*.json").scan({ cwd: dir, absolute: true })) {
+  for (const name of await readdir(dir)) {
+    if (!name.endsWith(".json") || name.startsWith(".")) continue
+    const file = path.join(dir, name)
     try {
-      const reminder = await Bun.file(file).json()
-      reminders.push(reminder)
+      reminders.push(JSON.parse(await readFile(file, "utf8")))
     } catch (error) {
       logger.error(`Failed to load reminder from ${file}:`, error)
     }
